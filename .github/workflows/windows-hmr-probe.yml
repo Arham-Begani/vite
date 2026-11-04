@@ -1,0 +1,77 @@
+name: Vite exact-source Windows HMR probe
+on:
+  push:
+    branches: [oss-validation/windows-hmr-23962]
+permissions:
+  contents: read
+jobs:
+  hmr:
+    name: Windows HMR - ${{ matrix.source.name }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - name: baseline
+            sha: 90bc034a97e7eccd0f3cbc69904fffa625a4c34d
+          - name: pr
+            sha: e21f58624d1a8bfb4b8e2e4c7dadb4e82687c210
+    env:
+      NODE_OPTIONS: --max-old-space-size=6144
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      VITEST_SEGFAULT_RETRY: '3'
+    steps:
+      - name: Checkout exact unmodified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Arham-Begani/vite
+          ref: ${{ matrix.source.sha }}
+          persist-credentials: false
+      - name: Verify source receipt
+        env:
+          EXPECTED_SOURCE: ${{ matrix.source.sha }}
+        run: |
+          $actualSource = git rev-parse HEAD
+          if ($actualSource -ne $env:EXPECTED_SOURCE) { throw "Unexpected source $actualSource" }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git show -s --format='%H %T'
+          Get-PSDrive C,D | Select-Object Name,Free,Used
+      - name: Install repository pnpm and exact upstream Windows Node
+        uses: pnpm/setup@fa36a5ef7dcdefc3a7cb25655c122e00cf6e636e
+        with:
+          version: 12.15.0
+          runtime: node@24.22.2
+          require-lockfile: true
+          cache: false
+      - name: Install Chromium
+        run: pnpm playwright install chromium
+      - name: Build packages
+        run: pnpm run build
+      - name: Probe the exact failed case three times with unchanged upstream retry settings
+        env:
+          RECEIPT_DIRECTORY: ${{ runner.temp }}/vite-hmr-probe
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:RECEIPT_DIRECTORY | Out-Null
+          $probeFailed = $false
+          foreach ($probeAttempt in 1..3) {
+            Write-Output "Independent probe attempt $probeAttempt"
+            pnpm run test-serve-bundled playground/hmr/__tests__/hmr.spec.ts --testNamePattern=acceptExports.*dynamic.import.*accepts.itself.if.all.its.exports.are.accepted 2>&1 | Tee-Object -FilePath (Join-Path $env:RECEIPT_DIRECTORY "attempt-$probeAttempt.log")
+            if ($LASTEXITCODE -ne 0) { $probeFailed = $true }
+            $probeOutput = (Get-Content -Raw (Join-Path $env:RECEIPT_DIRECTORY "attempt-$probeAttempt.log")) -replace '\x1b\[[0-9;]*m', ''
+            if ($probeOutput -notmatch 'Tests\s+1 passed') {
+              Write-Error 'The exact targeted case did not report one passing test.' -ErrorAction Continue
+              $probeFailed = $true
+            }
+          }
+          git diff --exit-code -- ':(exclude)**/node_modules/**'
+          if ($LASTEXITCODE -ne 0) { $probeFailed = $true }
+          if ($probeFailed) { exit 1 }
+      - name: Upload all probe outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vite-hmr-${{ matrix.source.name }}
+          path: ${{ runner.temp }}/vite-hmr-probe/*.log
+
